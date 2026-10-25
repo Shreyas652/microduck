@@ -10,6 +10,7 @@ from dataset import (
     Recording,
     average_precision,
     best_f1_threshold,
+    classification_metrics,
     dataset_fingerprint,
     discover_recordings,
     split_recordings,
@@ -108,6 +109,26 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "escapes the dataset"):
                 discover_recordings(root)
 
+    def test_manifest_rejects_aliases_of_the_same_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_wav(root / "clip.wav")
+            entries = [
+                {"path": "clip.wav", "label": "normal", "session": "first"},
+                {
+                    "path": "nested/../clip.wav",
+                    "label": "normal",
+                    "session": "second",
+                },
+            ]
+            (root / "manifest.jsonl").write_text(
+                "".join(json.dumps(entry) + "\n" for entry in entries),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "appears more than once"):
+                discover_recordings(root)
+
     def test_manifest_allows_audio_the_rust_extractor_can_resample(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -192,6 +213,20 @@ class MetricsTests(unittest.TestCase):
 
     def test_average_precision_is_one_for_a_perfect_ranking(self) -> None:
         self.assertEqual(average_precision([0, 1, 0, 1], [0.1, 0.8, 0.2, 0.9]), 1.0)
+
+    def test_threshold_sweep_matches_brute_force_with_ties_and_boundaries(self) -> None:
+        labels = [0, 1, 0, 1, 1, 0]
+        scores = [-0.1, 0.0, 0.4, 0.4, 1.0, 1.1]
+        candidates = {0.0, 1.0, *scores}
+        expected = max(
+            (
+                classification_metrics(labels, scores, threshold=threshold)
+                for threshold in candidates
+            ),
+            key=lambda item: (item.f1, item.precision, item.threshold),
+        )
+
+        self.assertEqual(best_f1_threshold(labels, scores), expected)
 
 
 if __name__ == "__main__":

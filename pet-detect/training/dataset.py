@@ -229,13 +229,15 @@ def discover_recordings(root: Path) -> tuple[list[Recording], bool]:
         else _legacy_recordings(root)
     )
 
-    paths: set[str] = set()
+    paths: set[Path] = set()
     for recording in recordings:
-        if recording.relative_path in paths:
+        # Manifest spellings such as `clip.wav` and `nested/../clip.wav` must not
+        # let one capture acquire two session IDs and cross the train/validation split.
+        if recording.path in paths:
             raise ValueError(
                 f"recording appears more than once: {recording.relative_path}"
             )
-        paths.add(recording.relative_path)
+        paths.add(recording.path)
     return recordings, manifest.is_file()
 
 
@@ -392,11 +394,65 @@ def classification_metrics(
 
 def best_f1_threshold(labels: Sequence[int], scores: Sequence[float]) -> Metrics:
     """Pick the most conservative threshold among equal-F1 operating points."""
-    candidates = sorted({0.0, 1.0, *(float(score) for score in scores)})
-    metrics = [
-        classification_metrics(labels, scores, threshold=value) for value in candidates
-    ]
-    return max(metrics, key=lambda item: (item.f1, item.precision, item.threshold))
+    if len(labels) != len(scores) or not labels:
+        raise ValueError("labels and scores must be non-empty and have equal length")
+    if any(label not in LABEL_NAMES for label in labels):
+        raise ValueError("labels must be zero or one")
+
+    ranked = sorted(
+        ((float(score), label) for score, label in zip(scores, labels)),
+        reverse=True,
+    )
+    candidates = sorted({0.0, 1.0, *(score for score, _ in ranked)}, reverse=True)
+    positives = sum(labels)
+    negatives = len(labels) - positives
+    true_positive = 0
+    false_positive = 0
+    index = 0
+    best: Metrics | None = None
+
+    # Descending thresholds only add predictions. Updating the confusion counts once per
+    # window avoids rescanning the full validation set for every distinct score.
+    for threshold in candidates:
+        while index < len(ranked) and ranked[index][0] >= threshold:
+            if ranked[index][1] == 1:
+                true_positive += 1
+            else:
+                false_positive += 1
+            index += 1
+        false_negative = positives - true_positive
+        true_negative = negatives - false_positive
+        precision = (
+            true_positive / (true_positive + false_positive)
+            if true_positive + false_positive
+            else 0.0
+        )
+        recall = true_positive / positives if positives else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        current = Metrics(
+            threshold=threshold,
+            accuracy=(true_positive + true_negative) / len(labels),
+            precision=precision,
+            recall=recall,
+            f1=f1,
+            true_positive=true_positive,
+            true_negative=true_negative,
+            false_positive=false_positive,
+            false_negative=false_negative,
+        )
+        if best is None or (current.f1, current.precision, current.threshold) > (
+            best.f1,
+            best.precision,
+            best.threshold,
+        ):
+            best = current
+
+    assert best is not None
+    return best
 
 
 def average_precision(labels: Sequence[int], scores: Sequence[float]) -> float:
